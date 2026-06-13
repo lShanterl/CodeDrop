@@ -23,10 +23,9 @@ const connectedClients = new Map<string, CustomWebSocket>(); // id -> socket
 
 export async function handleSocketConnections(fastify: FastifyInstance) {
   const socketHandler: WebsocketHandler = (connection, req) => {
-    const rawSocket = connection?.socket || (connection as any);
+    const rawSocket = connection;
     
     if (!rawSocket) {
-      fastify.log.error('Nie udało się przechwycić prawidłowego obiektu WebSocket!');
       return;
     }
 
