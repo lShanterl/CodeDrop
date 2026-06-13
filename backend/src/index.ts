@@ -6,7 +6,7 @@ import { handleSocketConnections } from './sockethandler.js';
 async function main() {
 	const app = fastify({ logger: true });
 
-	await app.register(cors, { origin: '*' });
+	await app.register(cors);
 
 	await handleSocketConnections(app);
 
