@@ -7,6 +7,7 @@ async function main() {
 	const app = fastify({ logger: true });
 
 	await app.register(cors);
+	await app.register(websocket); 
 
 	await handleSocketConnections(app);
 
