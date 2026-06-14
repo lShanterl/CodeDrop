@@ -3,6 +3,7 @@
 import { useState, useRef } from 'react';
 
 const CHUNK_SIZE = 16384;
+const BUFFER_THRESHOLD = 65536; // 64 KB - must be set on the channel before sending
 
 type PeerConnectionMap = Map<string, RTCPeerConnection>;
 type DataChannelMap = Map<string, RTCDataChannel>;
@@ -42,6 +43,8 @@ export default function Home() {
   const peersRef = useRef<PeerConnectionMap>(new Map());
   const controlChannelsRef = useRef<DataChannelMap>(new Map());
   const hostFilesRef = useRef<FileData[]>([]);
+  const roleRef = useRef<'host' | 'guest' | null>(null);
+  const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const addLog = (msg: string) => setTransferLog((prev) => [...prev, msg]);
 
@@ -62,7 +65,7 @@ export default function Home() {
       size: file.size,
       file
     }));
-    
+
     const updated = [...hostFilesRef.current, ...newFiles];
     hostFilesRef.current = updated;
     setHostFiles(updated);
@@ -106,7 +109,7 @@ export default function Home() {
     };
 
     if (isHost) {
-      addLog(`Connecting to peer: ${targetId.substring(0,6)}...`);
+      addLog(`Connecting to peer: ${targetId.substring(0, 6)}...`);
       const dc = peer.createDataChannel('control');
       setupControlChannel(dc, targetId, true);
     } else {
@@ -130,25 +133,26 @@ export default function Home() {
     dc.onopen = () => {
       setStatus('Connected directly to peer');
       if (isHost) {
-        dc.send(JSON.stringify({ 
-          type: 'file-list', 
-          files: hostFilesRef.current.map(f => ({ id: f.id, name: f.name, size: f.size })) 
+        dc.send(JSON.stringify({
+          type: 'file-list',
+          files: hostFilesRef.current.map(f => ({ id: f.id, name: f.name, size: f.size }))
         }));
+        addLog(`Sent file list to peer ${targetId.substring(0, 6)} (${hostFilesRef.current.length} file(s))`);
       }
     };
 
     dc.onclose = () => {
-      addLog(`Connection closed with peer ${targetId.substring(0,6)}`);
+      addLog(`Connection closed with peer ${targetId.substring(0, 6)}`);
       peersRef.current.delete(targetId);
       controlChannelsRef.current.delete(targetId);
     };
-    
+
     dc.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data);
+        const msg = JSON.parse(event.data as string);
         if (msg.type === 'file-list') {
           setAvailableFiles(msg.files);
-          addLog(`Updated file list received: ${msg.files.length} items available`);
+          addLog(`Updated file list received: ${msg.files.length} item(s) available`);
         }
         if (msg.type === 'request-file' && isHost) {
           const requestedFile = hostFilesRef.current.find(f => f.id === msg.fileId);
@@ -156,7 +160,9 @@ export default function Home() {
             startFileTransfer(targetId, requestedFile);
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('Error handling control channel message:', e);
+      }
     };
   };
 
@@ -166,20 +172,20 @@ export default function Home() {
 
     const fileDc = peer.createDataChannel(`file_${fileData.id}_${Math.random().toString(36).substr(2, 5)}`);
     fileDc.binaryType = 'arraybuffer';
+    fileDc.bufferedAmountLowThreshold = BUFFER_THRESHOLD;
 
     fileDc.onopen = async () => {
       addLog(`Sending file: ${fileData.name}`);
       fileDc.send(JSON.stringify({ type: 'file-start', id: fileData.id, name: fileData.name, size: fileData.size }));
-      
+
       const reader = fileData.file.stream().getReader();
-      
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         let offset = 0;
         while (offset < value.length) {
-          const chunk = value.slice(offset, offset + CHUNK_SIZE);
           if (fileDc.bufferedAmount > fileDc.bufferedAmountLowThreshold) {
             await new Promise<void>((resolve) => {
               fileDc.onbufferedamountlow = () => {
@@ -189,19 +195,20 @@ export default function Home() {
             });
           }
           if (fileDc.readyState !== 'open') break;
+          const chunk = value.slice(offset, offset + CHUNK_SIZE);
           fileDc.send(chunk.buffer);
           offset += CHUNK_SIZE;
         }
       }
-      
-      addLog(`Successfully uploaded: ${fileData.name}`);
-      setTimeout(() => fileDc.close(), 1000); 
+
+      addLog(`Successfully sent: ${fileData.name}`);
+      setTimeout(() => fileDc.close(), 1000);
     };
   };
 
   const setupFileReceiverChannel = (dc: RTCDataChannel) => {
     dc.binaryType = 'arraybuffer';
-    
+
     let fileBuffer: Uint8Array[] = [];
     let currentSize = 0;
     let expectedSize = 0;
@@ -216,42 +223,46 @@ export default function Home() {
             fileId = meta.id;
             fileName = meta.name;
             expectedSize = meta.size;
-            setDownloads(prev => ({ ...prev, [fileId]: { progress: 0, name: fileName, status: 'downloading' }}));
+            fileBuffer = [];
+            currentSize = 0;
+            setDownloads(prev => ({ ...prev, [fileId]: { progress: 0, name: fileName, status: 'downloading' } }));
             addLog(`Receiving file: ${fileName}`);
           }
-        } catch(e) {}
+        } catch (e) {
+          console.error('Error parsing file metadata:', e);
+        }
       } else if (event.data instanceof ArrayBuffer) {
         fileBuffer.push(new Uint8Array(event.data));
         currentSize += event.data.byteLength;
-        
+
         const pct = Math.min(Math.round((currentSize / expectedSize) * 100), 100);
-        
+
         setDownloads(prev => {
-           if (prev[fileId]?.progress === pct) return prev;
-           return { ...prev, [fileId]: { progress: pct, name: fileName, status: 'downloading' }};
+          if (prev[fileId]?.progress === pct) return prev;
+          return { ...prev, [fileId]: { progress: pct, name: fileName, status: 'downloading' } };
         });
 
         if (currentSize >= expectedSize) {
-           setDownloads(prev => ({ ...prev, [fileId]: { progress: 100, name: fileName, status: 'completed' }}));
-           addLog(`Successfully downloaded: ${fileName}`);
-           
-           const fileBlob = new Blob(fileBuffer as BlobPart[], { type: 'application/octet-stream' });
-           const downloadUrl = URL.createObjectURL(fileBlob);
-           const a = document.createElement('a');
-           a.href = downloadUrl;
-           a.download = fileName;
-           a.click();
-           URL.revokeObjectURL(downloadUrl);
-           fileBuffer = []; 
+          setDownloads(prev => ({ ...prev, [fileId]: { progress: 100, name: fileName, status: 'completed' } }));
+          addLog(`Successfully downloaded: ${fileName}`);
+
+          const fileBlob = new Blob(fileBuffer as BlobPart[], { type: 'application/octet-stream' });
+          const downloadUrl = URL.createObjectURL(fileBlob);
+          const a = document.createElement('a');
+          a.href = downloadUrl;
+          a.download = fileName;
+          a.click();
+          URL.revokeObjectURL(downloadUrl);
+          fileBuffer = [];
         }
       }
     };
   };
 
   const requestDownload = (fileId: string) => {
-    const dc = Array.from(controlChannelsRef.current.values())[0]; 
+    const dc = Array.from(controlChannelsRef.current.values())[0];
     if (dc && dc.readyState === 'open') {
-       dc.send(JSON.stringify({ type: 'request-file', fileId }));
+      dc.send(JSON.stringify({ type: 'request-file', fileId }));
     }
   };
 
@@ -259,6 +270,7 @@ export default function Home() {
 
   const connectWebSocket = (role: 'host' | 'guest', onConnectedAction: (ws: WebSocket) => void) => {
     setIsHostRole(role === 'host');
+    roleRef.current = role;
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       onConnectedAction(socketRef.current);
@@ -267,37 +279,53 @@ export default function Home() {
 
     const backendUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000/ws';
     const ws = new WebSocket(backendUrl);
+    socketRef.current = ws;
 
     ws.onopen = () => {
       setStatus('Connected to server');
       onConnectedAction(ws);
+
+      if (keepAliveRef.current) clearInterval(keepAliveRef.current);
+        keepAliveRef.current = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 25000);
+      };
+
+    ws.onclose = () => {
+      setStatus('Disconnected');
+      if (keepAliveRef.current) {
+        clearInterval(keepAliveRef.current);
+        keepAliveRef.current = null;
+      }
     };
 
     ws.onmessage = async (event) => {
-      const msg = JSON.parse(event.data);
+      const msg = JSON.parse(event.data as string);
 
       if (msg.type === 'room-created') {
         setRoomCode(msg.code);
         activeRoomCodeRef.current = msg.code;
-        setStatus(`Room Created`);
+        setStatus('Room Created');
       }
 
       if (msg.type === 'joined-room' && msg.success) setStatus('Joined room! Waiting for host...');
-      
+
       if (msg.type === 'guest-joined') {
         setStatus('Peer connected');
         const guestId = msg.guestId;
-        const peer = createPeerConnection(guestId, true); 
+        const peer = createPeerConnection(guestId, true);
         const offer = await peer.createOffer();
         await peer.setLocalDescription(offer);
         ws.send(JSON.stringify({ type: 'signal', code: activeRoomCodeRef.current, targetId: guestId, data: { offer } }));
       }
 
       if (msg.type === 'signal') {
-        const senderId = msg.from; 
+        const senderId = msg.from;
         let peer = peersRef.current.get(senderId);
 
-        if (!peer && role === 'guest') peer = createPeerConnection(senderId, false);
+        if (!peer && roleRef.current === 'guest') peer = createPeerConnection(senderId, false);
         if (!peer) return;
 
         if (msg.data.offer) {
@@ -305,16 +333,18 @@ export default function Home() {
           const answer = await peer.createAnswer();
           await peer.setLocalDescription(answer);
           ws.send(JSON.stringify({ type: 'signal', code: activeRoomCodeRef.current, targetId: senderId, data: { answer } }));
-        } 
-        else if (msg.data.answer) await peer.setRemoteDescription(new RTCSessionDescription(msg.data.answer));
-        else if (msg.data.candidate) await peer.addIceCandidate(new RTCIceCandidate(msg.data.candidate)).catch(() => {});
+        } else if (msg.data.answer) {
+          await peer.setRemoteDescription(new RTCSessionDescription(msg.data.answer));
+        } else if (msg.data.candidate) {
+          await peer.addIceCandidate(new RTCIceCandidate(msg.data.candidate)).catch(() => {});
+        }
       }
     };
   };
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full bg-slate-950 selection:bg-indigo-500/30 overflow-hidden text-slate-100 font-sans relative">
-      
+
       <div className="md:hidden flex items-center justify-between bg-slate-900 border-b border-slate-800 px-5 py-4 z-30 shrink-0">
         <div className="flex items-center gap-3">
           <h1 className="text-xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400 tracking-tight">
@@ -325,7 +355,7 @@ export default function Home() {
             Active
           </span>
         </div>
-        <button 
+        <button
           onClick={() => setSidebarOpen(true)}
           className="p-2 text-slate-400 hover:text-slate-200 transition-colors rounded-lg bg-slate-950 border border-slate-800"
         >
@@ -336,7 +366,7 @@ export default function Home() {
       </div>
 
       {sidebarOpen && (
-        <div 
+        <div
           onClick={() => setSidebarOpen(false)}
           className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden transition-opacity duration-300"
         />
@@ -350,7 +380,7 @@ export default function Home() {
             </h1>
             <p className="text-xs text-slate-400 font-medium tracking-wide">P2P File Sharing Network</p>
           </div>
-          <button 
+          <button
             onClick={() => setSidebarOpen(false)}
             className="md:hidden p-2 text-slate-400 hover:text-slate-200 transition-colors"
           >
@@ -361,13 +391,13 @@ export default function Home() {
         </div>
 
         <div className="p-6 flex flex-col gap-6 flex-1 overflow-hidden">
-          
+
           <div className="bg-slate-950 p-4 rounded-xl border border-slate-800">
             <h3 className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">Connection Status</h3>
             <p className={`text-sm font-medium truncate ${status.includes('CONNECTED') || status.includes('peer') ? 'text-emerald-400' : 'text-blue-400'}`}>
               {status}
             </p>
-            
+
             {roomCode && (
               <div className="mt-4 pt-4 border-t border-slate-800">
                 <span className="text-[10px] uppercase font-semibold text-slate-400 tracking-wider block mb-2">Room Code</span>
@@ -376,26 +406,26 @@ export default function Home() {
                 </div>
               </div>
             )}
-            
+
             {isHostRole !== null && !roomCode && (
-               <div className="mt-4 pt-4 border-t border-slate-800">
-                 <span className="text-[10px] uppercase font-semibold text-slate-400 tracking-wider block mb-2">Your Role</span>
-                 <span className="text-blue-400 text-xs font-semibold bg-blue-950/40 px-3 py-1 rounded-md border border-blue-900/50 inline-block tracking-wide">
-                   {isHostRole ? 'Sender' : 'Receiver'}
-                 </span>
-               </div>
+              <div className="mt-4 pt-4 border-t border-slate-800">
+                <span className="text-[10px] uppercase font-semibold text-slate-400 tracking-wider block mb-2">Your Role</span>
+                <span className="text-blue-400 text-xs font-semibold bg-blue-950/40 px-3 py-1 rounded-md border border-blue-900/50 inline-block tracking-wide">
+                  {isHostRole ? 'Sender' : 'Receiver'}
+                </span>
+              </div>
             )}
           </div>
 
           {isHostRole === null && (
             <div className="flex flex-col gap-4">
-              <button 
+              <button
                 onClick={() => connectWebSocket('host', (ws) => ws.send(JSON.stringify({ type: 'create-room' })))}
                 className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-medium transition-all text-sm active:scale-[0.98] shadow-md"
               >
                 Create Share Room
               </button>
-              
+
               <div className="relative flex items-center py-1">
                 <div className="flex-grow border-t border-slate-800"></div>
                 <span className="flex-shrink-0 mx-4 text-slate-500 text-[10px] font-bold tracking-wider">OR JOIN ROOM</span>
@@ -403,16 +433,16 @@ export default function Home() {
               </div>
 
               <div className="flex gap-2">
-                <input 
-                  type="text" 
-                  placeholder="Enter Room Code" 
-                  value={inputCode} 
+                <input
+                  type="text"
+                  placeholder="Enter Room Code"
+                  value={inputCode}
                   onChange={(e) => setInputCode(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg px-3 py-2 text-center uppercase tracking-wider font-semibold placeholder-slate-600 focus:outline-none focus:border-indigo-500 text-sm"
                 />
-                <button 
+                <button
                   onClick={() => {
-                    if(!inputCode) return;
+                    if (!inputCode) return;
                     activeRoomCodeRef.current = inputCode.toUpperCase();
                     connectWebSocket('guest', (ws) => ws.send(JSON.stringify({ type: 'join-room', code: inputCode.toUpperCase() })));
                     setSidebarOpen(false);
@@ -426,7 +456,7 @@ export default function Home() {
           )}
 
           <div className="flex-1 flex flex-col min-h-[150px]">
-             <h4 className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-2">
+            <h4 className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-2">
               <span className={`w-2 h-2 rounded-full ${status.includes('Disconnected') ? 'bg-slate-600' : 'bg-emerald-500 animate-pulse'}`}></span>
               Activity Log
             </h4>
@@ -448,7 +478,7 @@ export default function Home() {
       </aside>
 
       <main className="flex-1 bg-gradient-to-tr from-slate-950 via-slate-900 to-slate-950 p-6 md:p-10 overflow-y-auto relative z-10 h-full">
-        
+
         {isHostRole === null && (
           <div className="h-full flex flex-col items-center justify-center text-slate-600 select-none text-center max-w-sm mx-auto">
             <svg className="w-12 h-12 mb-4 text-indigo-500/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -498,7 +528,7 @@ export default function Home() {
                         <p className="text-slate-200 font-medium truncate text-sm" title={f.name}>{f.name}</p>
                       </div>
                       <span className="text-slate-400 text-xs font-medium bg-slate-950 px-2 py-1 rounded border border-slate-800 whitespace-nowrap">
-                        {(f.size/1024/1024).toFixed(2)} MB
+                        {(f.size / 1024 / 1024).toFixed(2)} MB
                       </span>
                     </div>
                   ))}
@@ -516,8 +546,8 @@ export default function Home() {
                 <p className="text-slate-400 text-xs mt-1">Files currently shared by the host browser.</p>
               </div>
               {availableFiles.length > 1 && (
-                <button 
-                  onClick={requestAllDownloads} 
+                <button
+                  onClick={requestAllDownloads}
                   className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-xl text-xs font-medium shadow-md transition-all active:scale-95 tracking-wide w-full sm:w-auto text-center"
                 >
                   Download All
@@ -538,25 +568,25 @@ export default function Home() {
                   const dStatus = downloads[f.id];
                   return (
                     <div key={f.id} className="bg-slate-900 rounded-xl border border-slate-800 relative overflow-hidden shadow-md flex flex-col h-32 hover:border-slate-700 transition-colors">
-                      
+
                       {dStatus && dStatus.status === 'downloading' && (
                         <div className="absolute inset-0 bg-indigo-500/5 z-0 transition-all duration-300" style={{ width: `${dStatus.progress}%` }} />
                       )}
-                      
+
                       <div className="p-4 flex-1 flex flex-col justify-between relative z-10">
                         <div>
                           <p className="text-sm font-semibold text-slate-200 line-clamp-2 leading-snug" title={f.name}>{f.name}</p>
                           <p className="text-xs text-slate-400 mt-1">{(f.size / 1024 / 1024).toFixed(2)} MB</p>
                         </div>
-                        
+
                         <div className="flex justify-end mt-2">
                           {dStatus?.status === 'completed' ? (
                             <span className="text-emerald-400 text-xs font-semibold bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-900/30">Downloaded</span>
                           ) : dStatus?.status === 'downloading' ? (
                             <span className="text-blue-400 text-xs font-semibold bg-blue-950/40 px-2.5 py-1 rounded border border-blue-900/30 w-16 text-center tracking-wide">{dStatus.progress}%</span>
                           ) : (
-                            <button 
-                              onClick={() => requestDownload(f.id)} 
+                            <button
+                              onClick={() => requestDownload(f.id)}
                               className="bg-indigo-600 hover:bg-indigo-500 text-xs px-3 py-1.5 rounded-lg text-white font-medium transition-colors shadow-sm"
                             >
                               Download
@@ -567,7 +597,7 @@ export default function Home() {
 
                       {dStatus && dStatus.status === 'downloading' && (
                         <div className="w-full h-1 bg-slate-950 absolute bottom-0 left-0">
-                           <div className="h-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.5)]" style={{ width: `${dStatus.progress}%` }}></div>
+                          <div className="h-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.5)]" style={{ width: `${dStatus.progress}%` }}></div>
                         </div>
                       )}
                     </div>

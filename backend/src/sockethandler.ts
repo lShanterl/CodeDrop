@@ -10,90 +10,91 @@ type CustomWebSocket = WebSocket & {
 type SignalMessage =
   | { type: 'create-room' }
   | { type: 'join-room'; code: string }
-  | { type: 'signal'; code: string; data: unknown; targetId?: string }; 
-  
+  | { type: 'signal'; code: string; data: unknown; targetId?: string }
+  | { type: 'ping' };
 
 type Room = {
   hostId: string;
   guestIds: Set<string>;
 };
 
-const activeRooms = new Map<string, Room>();                  // code -> room
-const connectedClients = new Map<string, CustomWebSocket>(); // id -> socket
+const activeRooms = new Map<string, Room>();                   // code -> room
+const connectedClients = new Map<string, CustomWebSocket>();  // id -> socket
 
 export async function handleSocketConnections(fastify: FastifyInstance) {
   const socketHandler: WebsocketHandler = (connection, req) => {
     const rawSocket = connection;
-    
+
     if (!rawSocket) {
       return;
     }
 
-    const client = rawSocket as CustomWebSocket;    const id = randomUUID();
+    const client = rawSocket as CustomWebSocket;
+    const id = randomUUID();
     client.id = id;
     connectedClients.set(id, client);
 
     fastify.log.info(`New client connected: ${id}`);
 
-
     client.on('message', (message: Buffer) => {
-        try {
-            const parsedMessage = JSON.parse(message.toString()) as SignalMessage;
+      try {
+        const parsedMessage = JSON.parse(message.toString()) as SignalMessage;
 
-            // CASE 1: create a new room
-            if (parsedMessage.type === 'create-room') {
-              const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-              activeRooms.set(roomCode, { hostId: id, guestIds: new Set() });
-              client.send(JSON.stringify({ type: 'room-created', code: roomCode }));
-              return;
-            }
-            
-            // CASE 2: join an existing room
-            if (parsedMessage.type === 'join-room') {
-              const { code } = parsedMessage;
-              const room = activeRooms.get(code);
-              const hostSocket = room ? connectedClients.get(room.hostId) : null;
-            
-              if (room && hostSocket) {
-                room.guestIds.add(id);
-            
-                client.send(JSON.stringify({ type: 'joined-room', success: true, hostId: room.hostId }));
-                hostSocket.send(JSON.stringify({ type: 'guest-joined', guestId: id }));
-              } else {
-                client.send(JSON.stringify({ type: 'joined-room', success: false, reason: 'not-found' }));
-              }
-              return;
-            }
+        if (parsedMessage.type === 'ping') {
+          return;
+        }
 
-            // CASE 3: relay signaling data
-            if (parsedMessage.type === 'signal') {
-              const { code, data, targetId } = parsedMessage;
-              const room = activeRooms.get(code);
-              if (!room) return;
-            
-              let target: CustomWebSocket | undefined;
-            
-              if (id === room.hostId) {
-                // host -> guest
-                const actualTargetId = targetId || Array.from(room.guestIds)[0];
-                if (!actualTargetId) return;
-                target = connectedClients.get(actualTargetId);
-              } else {
-                // guest -> host
-                target = connectedClients.get(room.hostId);
-              }
-          
-              target?.send(JSON.stringify({ type: 'signal', data, from: id }));
-              return;
-            }
-        
+        // CASE 1: create a new room
+        if (parsedMessage.type === 'create-room') {
+          const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+          activeRooms.set(roomCode, { hostId: id, guestIds: new Set() });
+          client.send(JSON.stringify({ type: 'room-created', code: roomCode }));
+          return;
         }
-        catch (err) {
-            fastify.log.error(err, 'Failed to parse message');
+
+        // CASE 2: join an existing room
+        if (parsedMessage.type === 'join-room') {
+          const { code } = parsedMessage;
+          const room = activeRooms.get(code);
+          const hostSocket = room ? connectedClients.get(room.hostId) : null;
+
+          if (room && hostSocket) {
+            room.guestIds.add(id);
+            client.send(JSON.stringify({ type: 'joined-room', success: true, hostId: room.hostId }));
+            hostSocket.send(JSON.stringify({ type: 'guest-joined', guestId: id }));
+          } else {
+            client.send(JSON.stringify({ type: 'joined-room', success: false, reason: 'not-found' }));
+          }
+          return;
         }
-            
+
+        // CASE 3: relay signaling data
+        if (parsedMessage.type === 'signal') {
+          const { code, data, targetId } = parsedMessage;
+          const room = activeRooms.get(code);
+          if (!room) return;
+
+          let target: CustomWebSocket | undefined;
+
+          if (id === room.hostId) {
+            // host -> specific guest
+            const actualTargetId = targetId || Array.from(room.guestIds)[0];
+            if (!actualTargetId) return;
+            target = connectedClients.get(actualTargetId);
+          } else {
+            // guest -> host
+            target = connectedClients.get(room.hostId);
+          }
+
+          target?.send(JSON.stringify({ type: 'signal', data, from: id }));
+          return;
+        }
+
+      } catch (err) {
+        fastify.log.error(err, 'Failed to parse message');
+      }
     });
-        
+
     client.on('close', () => {
       connectedClients.delete(id);
 
@@ -113,8 +114,7 @@ export async function handleSocketConnections(fastify: FastifyInstance) {
 
       fastify.log.info(`Client ${id} disconnected, memory cleared.`);
     });
-    };
+  };
 
   fastify.get('/ws', { websocket: true }, socketHandler);
-
 }
