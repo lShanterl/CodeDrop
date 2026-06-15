@@ -72,6 +72,14 @@ export default function Home() {
     broadcastFileList(updated);
   };
 
+  const removeFile = (fileId: string) => {
+    const updated = hostFilesRef.current.filter(f => f.id !== fileId);
+    hostFilesRef.current = updated;
+    setHostFiles(updated);
+    broadcastFileList(updated);
+    addLog(`Removed file from catalog`);
+  };
+
   const createPeerConnection = (targetId: string, isHost: boolean) => {
     const peer = new RTCPeerConnection({
       iceServers: [
@@ -267,6 +275,15 @@ export default function Home() {
   };
 
   const requestAllDownloads = () => availableFiles.forEach(f => requestDownload(f.id));
+
+  const redownload = (fileId: string) => {
+    setDownloads(prev => {
+      const updated = { ...prev };
+      delete updated[fileId];
+      return updated;
+    });
+    setTimeout(() => requestDownload(fileId), 50);
+  };
 
   const connectWebSocket = (role: 'host' | 'guest', onConnectedAction: (ws: WebSocket) => void) => {
     setIsHostRole(role === 'host');
@@ -523,13 +540,22 @@ export default function Home() {
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {hostFiles.map(f => (
-                    <div key={f.id} className="bg-slate-900 p-4 rounded-xl border border-slate-800 flex items-center justify-between shadow-sm hover:border-slate-700 transition-colors">
-                      <div className="overflow-hidden pr-3">
+                    <div key={f.id} className="bg-slate-900 p-4 rounded-xl border border-slate-800 flex items-center justify-between shadow-sm hover:border-slate-700 transition-colors group">
+                      <div className="overflow-hidden pr-3 flex-1 min-w-0">
                         <p className="text-slate-200 font-medium truncate text-sm" title={f.name}>{f.name}</p>
+                        <span className="text-slate-500 text-xs mt-0.5 block">
+                          {(f.size / 1024 / 1024).toFixed(2)} MB
+                        </span>
                       </div>
-                      <span className="text-slate-400 text-xs font-medium bg-slate-950 px-2 py-1 rounded border border-slate-800 whitespace-nowrap">
-                        {(f.size / 1024 / 1024).toFixed(2)} MB
-                      </span>
+                      <button
+                        onClick={() => removeFile(f.id)}
+                        title="Remove from catalog"
+                        className="ml-2 p-1.5 text-slate-600 hover:text-red-400 hover:bg-red-950/40 rounded-lg border border-transparent hover:border-red-900/40 transition-all opacity-0 group-hover:opacity-100 shrink-0"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
                     </div>
                   ))}
                 </div>
@@ -581,7 +607,18 @@ export default function Home() {
 
                         <div className="flex justify-end mt-2">
                           {dStatus?.status === 'completed' ? (
-                            <span className="text-emerald-400 text-xs font-semibold bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-900/30">Downloaded</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-emerald-400 text-xs font-semibold bg-emerald-950/40 px-2.5 py-1 rounded border border-emerald-900/30">Downloaded</span>
+                              <button
+                                onClick={() => redownload(f.id)}
+                                title="Download again"
+                                className="p-1.5 text-slate-500 hover:text-indigo-400 hover:bg-indigo-950/40 rounded-lg border border-transparent hover:border-indigo-900/40 transition-all"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                </svg>
+                              </button>
+                            </div>
                           ) : dStatus?.status === 'downloading' ? (
                             <span className="text-blue-400 text-xs font-semibold bg-blue-950/40 px-2.5 py-1 rounded border border-blue-900/30 w-16 text-center tracking-wide">{dStatus.progress}%</span>
                           ) : (
