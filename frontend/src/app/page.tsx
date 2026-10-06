@@ -281,7 +281,8 @@ export default function Home() {
         // must implement the previous in RAM save for browsers that refused to implement the file save // safari & firefox
         return; 
       }
-      const handle = await window.showSaveFilePicker({
+      // ignore the strict rules in ts that produced a false positive on vercel app
+      const handle = await (window as any).showSaveFilePicker({
         suggestedName: suggestedFileName
       });
       
