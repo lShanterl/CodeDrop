@@ -2,9 +2,12 @@
 
 import { useState, useRef } from 'react';
 
-const CHUNK_SIZE = 16384;
-const BUFFER_THRESHOLD = 65536; // 64 KB - must be set on the channel before sending
+// modern browsers can handle 64kb chunks so the fix to the SCTP message was too strict
+//const CHUNK_SIZE = 16384;
+//const BUFFER_THRESHOLD = 65536; // 64 KB - must be set on the channel before sending
 
+const CHUNK_SIZE = 65536;
+const BUFFER_THRESHOLD = 8388608;
 type PeerConnectionMap = Map<string, RTCPeerConnection>;
 type DataChannelMap = Map<string, RTCDataChannel>;
 
@@ -45,6 +48,9 @@ export default function Home() {
   const hostFilesRef = useRef<FileData[]>([]);
   const roleRef = useRef<'host' | 'guest' | null>(null);
   const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  //important, makes the file save on device, skips horrendously inneficient on RAM storage
+  const fileWritersRef = useRef<Map<string, FileSystemWritableFileStream>>(new Map());
 
   const addLog = (msg: string) => setTransferLog((prev) => [...prev, msg]);
 
@@ -217,13 +223,12 @@ export default function Home() {
   const setupFileReceiverChannel = (dc: RTCDataChannel) => {
     dc.binaryType = 'arraybuffer';
 
-    let fileBuffer: Uint8Array[] = [];
     let currentSize = 0;
     let expectedSize = 0;
     let fileName = '';
     let fileId = '';
 
-    dc.onmessage = (event) => {
+    dc.onmessage = async (event) => {
       if (typeof event.data === 'string') {
         try {
           const meta = JSON.parse(event.data);
@@ -231,7 +236,6 @@ export default function Home() {
             fileId = meta.id;
             fileName = meta.name;
             expectedSize = meta.size;
-            fileBuffer = [];
             currentSize = 0;
             setDownloads(prev => ({ ...prev, [fileId]: { progress: 0, name: fileName, status: 'downloading' } }));
             addLog(`Receiving file: ${fileName}`);
@@ -240,37 +244,59 @@ export default function Home() {
           console.error('Error parsing file metadata:', e);
         }
       } else if (event.data instanceof ArrayBuffer) {
-        fileBuffer.push(new Uint8Array(event.data));
         currentSize += event.data.byteLength;
 
         const pct = Math.min(Math.round((currentSize / expectedSize) * 100), 100);
 
-        setDownloads(prev => {
-          if (prev[fileId]?.progress === pct) return prev;
-          return { ...prev, [fileId]: { progress: pct, name: fileName, status: 'downloading' } };
-        });
+        const writable = fileWritersRef.current.get(fileId);
 
-        if (currentSize >= expectedSize) {
-          setDownloads(prev => ({ ...prev, [fileId]: { progress: 100, name: fileName, status: 'completed' } }));
-          addLog(`Successfully downloaded: ${fileName}`);
+        if(writable)  {
+          await writable.write(event.data);
 
-          const fileBlob = new Blob(fileBuffer as BlobPart[], { type: 'application/octet-stream' });
-          const downloadUrl = URL.createObjectURL(fileBlob);
-          const a = document.createElement('a');
-          a.href = downloadUrl;
-          a.download = fileName;
-          a.click();
-          URL.revokeObjectURL(downloadUrl);
-          fileBuffer = [];
+          setDownloads(prev => {
+            if(prev[fileId]?.progress === pct) return prev;
+            return { ...prev, [fileId]: { progress: pct, name: fileName, status: 'downloading' } };
+          })
+
+          if (currentSize >= expectedSize) {
+            await writable.close();
+            fileWritersRef.current.delete(fileId);
+            
+            setDownloads(prev => ({ ...prev, [fileId]: { progress: 100, name: fileName, status: 'completed' } }));
+            addLog(`Successfully downloaded and saved: ${fileName}`);
+          }
         }
       }
     };
   };
 
-  const requestDownload = (fileId: string) => {
-    const dc = Array.from(controlChannelsRef.current.values())[0];
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify({ type: 'request-file', fileId }));
+  const requestDownload = async (fileId: string) => {
+    const fileMeta = availableFiles.find(f => f.id === fileId);
+    const suggestedFileName = fileMeta ? fileMeta.name : 'downloaded_file';
+    try {
+      // 1. Prompt user to choose where to save the file
+
+      if (!('showSaveFilePicker' in window)) {
+        console.error("This browser does not support the File System Access API.");
+        // must implement the previous in RAM save for browsers that refused to implement the file save // safari & firefox
+        return; 
+      }
+      const handle = await window.showSaveFilePicker({
+        suggestedName: suggestedFileName
+      });
+      
+      // 2. Open a writable stream directly to the hard drive
+      const writable = await handle.createWritable();
+      
+      // 3. Save it to your ref so the receiver function can find it
+      fileWritersRef.current.set(fileId, writable);
+
+      const dc = Array.from(controlChannelsRef.current.values())[0];
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify({ type: 'request-file', fileId }));
+      }
+    } catch (err) {
+
     }
   };
 
