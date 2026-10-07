@@ -49,8 +49,10 @@ export default function Home() {
   const roleRef = useRef<'host' | 'guest' | null>(null);
   const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  //important, makes the file save on device, skips horrendously inneficient on RAM storage
+  // saves on device immediately skipping horrendously inneficient memory wise download
   const fileWritersRef = useRef<Map<string, FileSystemWritableFileStream>>(new Map());
+  // saves in RAM first - used if not supporting file API
+  const unsupportedFilesRef = useRef<Map<string, Uint8Array[]>>(new Map());
 
   const addLog = (msg: string) => setTransferLog((prev) => [...prev, msg]);
 
@@ -249,7 +251,7 @@ export default function Home() {
         const pct = Math.min(Math.round((currentSize / expectedSize) * 100), 100);
 
         const writable = fileWritersRef.current.get(fileId);
-
+        const unsupportedWritable = unsupportedFilesRef.current.get(fileId);
         if(writable)  {
           await writable.write(event.data);
 
@@ -265,6 +267,28 @@ export default function Home() {
             setDownloads(prev => ({ ...prev, [fileId]: { progress: 100, name: fileName, status: 'completed' } }));
             addLog(`Successfully downloaded and saved: ${fileName}`);
           }
+        } // version for strict browsers such as safari or firefox
+        else if(unsupportedWritable){
+          unsupportedWritable.push(new Uint8Array(event.data));
+
+          if(currentSize >= expectedSize){
+            // reconstructing the file from RAM
+            const fileBlob = new Blob(unsupportedWritable as BlobPart[], { type: 'application/octet-stream' });
+            const downloadUrl = URL.createObjectURL(fileBlob);
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(downloadUrl);
+          }
+          // crucial to release RAM immediately after the file is being saved on device
+          unsupportedFilesRef.current.delete(fileId);  
+
+          setDownloads(prev => {
+            if(prev[fileId]?.progress === pct) return prev;
+            return { ...prev, [fileId]: { progress: pct, name: fileName, status: 'downloading' } };
+          });
+          addLog(`Successfully downloaded via fallback: ${fileName}`);
         }
       }
     };
@@ -276,9 +300,15 @@ export default function Home() {
     try {
       // 1. Prompt user to choose where to save the file
 
+      // if not having showSafeFilePicker in window - we use in RAM storage for unsupported browsers 
       if (!('showSaveFilePicker' in window)) {
-        console.error("This browser does not support the File System Access API.");
-        // must implement the previous in RAM save for browsers that refused to implement the file save // safari & firefox
+        console.error("This browser does not support the File System Access API - saving in RAM");
+        unsupportedFilesRef.current.set(fileId, []);
+        const dc = Array.from(controlChannelsRef.current.values())[0];
+        if (dc && dc.readyState === 'open') {
+          dc.send(JSON.stringify({ type: 'request-file', fileId }));
+
+        }
         return; 
       }
       // ignore the strict rules in ts that produced a false positive on vercel app
@@ -289,7 +319,7 @@ export default function Home() {
       // 2. Open a writable stream directly to the hard drive
       const writable = await handle.createWritable();
       
-      // 3. Save it to your ref so the receiver function can find it
+      // 3. Save it to the ref so the receiver function can find it
       fileWritersRef.current.set(fileId, writable);
 
       const dc = Array.from(controlChannelsRef.current.values())[0];
